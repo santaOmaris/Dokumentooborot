@@ -1,0 +1,30 @@
+{
+	admin off
+}
+
+:80 {
+	@iam path /api/iam/*
+	handle @iam {
+		reverse_proxy iam-service:8081
+	}
+
+	@catalog path /api/catalog/*
+	handle @catalog {
+		reverse_proxy catalog-service:8082
+	}
+
+	@orchestrator path /api/orchestrator/*
+	handle @orchestrator {
+		reverse_proxy orchestrator-service:8084
+	}
+
+	@collaboration path /api/collaboration/*
+	handle @collaboration {
+		reverse_proxy collaboration-service:8083
+	}
+
+	# Всё остальное → фронтенд (SPA)
+	handle {
+		reverse_proxy frontend:4173
+	}
+}

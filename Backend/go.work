@@ -1,0 +1,9 @@
+go 1.25.0
+
+use (
+	./go-services/catalog-service
+	./go-services/collaboration-service
+	./go-services/iam-service
+	./go-services/orchestrator-service
+	./pkg
+)

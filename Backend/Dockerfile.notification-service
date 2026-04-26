@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1
+# Build context: Backend/
+
+FROM gradle:8.7-jdk17 AS builder
+WORKDIR /workspace
+COPY java-services/notification-service/ java-services/notification-service/
+WORKDIR /workspace/java-services/notification-service
+RUN gradle installDist --no-daemon -x test
+
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+COPY --from=builder /workspace/java-services/notification-service/build/install/notification-service/ .
+ENTRYPOINT ["./bin/notification-service"]

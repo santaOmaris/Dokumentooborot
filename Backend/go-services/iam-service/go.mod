@@ -1,0 +1,22 @@
+module iam-service
+
+go 1.24.0
+
+require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
+	github.com/jackc/pgx/v5 v5.7.4
+	golang.org/x/crypto v0.47.0
+)
+
+require docflow.local/pkg v0.0.0
+
+require (
+	golang.org/x/net v0.49.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/text v0.33.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect
+	google.golang.org/grpc v1.80.0 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
+)
+
+replace docflow.local/pkg => ../../pkg

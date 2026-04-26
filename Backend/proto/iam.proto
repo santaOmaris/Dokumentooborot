@@ -1,0 +1,43 @@
+syntax = "proto3";
+package iam;
+option go_package = "docflow.local/pkg/pb/iam;iampb";
+
+// Используется оркестратором: получить данные пользователя по логину.
+message GetUserByLoginRequest {
+  string login = 1;
+}
+
+message UserResponse {
+  int32  id            = 1;
+  string login         = 2;
+  string email         = 3;
+  string full_name     = 4;
+  int32  department_id = 5;
+  bool   is_head       = 6;
+  string system_role   = 7;
+}
+
+// Используется оркестратором: получить начальников отдела (для назначения визировщика).
+message GetManagersByDepartmentRequest {
+  int32 department_id = 1;
+}
+
+message ManagersResponse {
+  repeated UserResponse managers = 1;
+}
+
+// Используется notification-service: получить email пользователя.
+message GetUserEmailRequest {
+  int32 user_id = 1;
+}
+
+message GetUserEmailResponse {
+  string email     = 1;
+  string full_name = 2;
+}
+
+service IAMService {
+  rpc GetUserByLogin(GetUserByLoginRequest)                   returns (UserResponse);
+  rpc GetManagersByDepartment(GetManagersByDepartmentRequest) returns (ManagersResponse);
+  rpc GetUserEmail(GetUserEmailRequest)                       returns (GetUserEmailResponse);
+}

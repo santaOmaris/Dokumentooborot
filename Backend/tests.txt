@@ -1,0 +1,1200 @@
+===== ./go-services/catalog-service/api/handlers/document_handlers_test.go =====
+package handlers
+
+import (
+	"bytes"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"regexp"
+	"strings"
+	"testing"
+
+	"docflow.local/pkg/auth"
+	db "catalog-service/db/generated"
+
+	"github.com/DATA-DOG/go-sqlmock"
+)
+
+func buildMultipartRequest(t *testing.T, fields map[string]string) (*bytes.Buffer, string) {
+	t.Helper()
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	for k, v := range fields {
+		if err := writer.WriteField(k, v); err != nil {
+			t.Fatalf("WriteField error: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close error: %v", err)
+	}
+	return body, writer.FormDataContentType()
+}
+
+func TestUploadDocumentHandlerForbiddenForForeignDepartment(t *testing.T) {
+	h := &DocumentHandlers{}
+	handler := auth.AuthMiddleware(h.UploadDocumentHandler())
+
+	token, err := auth.GenerateToken(4, "user2", "USER", false, "3")
+	if err != nil {
+		t.Fatalf("GenerateToken error: %v", err)
+	}
+
+	body, contentType := buildMultipartRequest(t, map[string]string{
+		"title":         "forbidden",
+		"folder_id":     "17",
+		"department_id": "2",
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/catalog/documents", body)
+	req.Header.Set("Content-Type", contentType)
+	req.AddCookie(&http.Cookie{Name: "jwt_token", Value: token})
+
+	rr := httptest.NewRecorder()
+	handler(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("unexpected status: %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUploadDocumentHandlerForbiddenForHeadOnlyFolder(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New error: %v", err)
+	}
+	defer sqlDB.Close()
+
+	q := db.New(sqlDB)
+	h := &DocumentHandlers{Q: q}
+	handler := auth.AuthMiddleware(h.UploadDocumentHandler())
+
+	token, err := auth.GenerateToken(4, "user2", "USER", false, "3")
+	if err != nil {
+		t.Fatalf("GenerateToken error: %v", err)
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, department_id, parent_id, name, is_system FROM folders WHERE id = $1")).
+		WithArgs(int32(17)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "department_id", "parent_id", "name", "is_system"}).
+			AddRow(int32(17), int32(3), nil, "head_only", true))
+
+	body, contentType := buildMultipartRequest(t, map[string]string{
+		"title":         "forbidden",
+		"folder_id":     "17",
+		"department_id": "3",
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/catalog/documents", body)
+	req.Header.Set("Content-Type", contentType)
+	req.AddCookie(&http.Cookie{Name: "jwt_token", Value: token})
+
+	rr := httptest.NewRecorder()
+	handler(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("unexpected status: %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestUploadDocumentHandlerValidationErrors(t *testing.T) {
+	h := &DocumentHandlers{}
+
+	body1, ct1 := buildMultipartRequest(t, map[string]string{"folder_id": "1", "department_id": "1"})
+	req1 := httptest.NewRequest(http.MethodPost, "/api/catalog/documents", body1)
+	req1.Header.Set("Content-Type", ct1)
+	rr1 := httptest.NewRecorder()
+	h.UploadDocumentHandler()(rr1, req1)
+	if rr1.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for missing title: %d", rr1.Code)
+	}
+
+	body2, ct2 := buildMultipartRequest(t, map[string]string{"title": "x", "department_id": "1"})
+	req2 := httptest.NewRequest(http.MethodPost, "/api/catalog/documents", body2)
+	req2.Header.Set("Content-Type", ct2)
+	rr2 := httptest.NewRecorder()
+	h.UploadDocumentHandler()(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for missing folder_id: %d", rr2.Code)
+	}
+
+	body3, ct3 := buildMultipartRequest(t, map[string]string{"title": "x", "folder_id": "1"})
+	req3 := httptest.NewRequest(http.MethodPost, "/api/catalog/documents", body3)
+	req3.Header.Set("Content-Type", ct3)
+	rr3 := httptest.NewRecorder()
+	h.UploadDocumentHandler()(rr3, req3)
+	if rr3.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for missing department_id: %d", rr3.Code)
+	}
+
+	body4, ct4 := buildMultipartRequest(t, map[string]string{"title": "x", "folder_id": "1", "department_id": "a"})
+	req4 := httptest.NewRequest(http.MethodPost, "/api/catalog/documents", body4)
+	req4.Header.Set("Content-Type", ct4)
+	rr4 := httptest.NewRecorder()
+	h.UploadDocumentHandler()(rr4, req4)
+	if rr4.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for bad department_id: %d", rr4.Code)
+	}
+}
+
+func TestDownloadAndGetHandlersInvalidID(t *testing.T) {
+	h := &DocumentHandlers{}
+
+	rr1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodGet, "/api/catalog/documents/bad/download", nil)
+	req1.SetPathValue("id", "bad")
+	h.DownloadDocumentHandler()(rr1, req1)
+	if rr1.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for download bad id: %d", rr1.Code)
+	}
+
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/api/catalog/documents/bad", nil)
+	req2.SetPathValue("id", "bad")
+	GetDocumentHandler(nil)(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for get bad id: %d", rr2.Code)
+	}
+}
+
+func TestFolderHistorySearchAndMoveValidation(t *testing.T) {
+	rr1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodGet, "/api/catalog/folders/bad/documents", nil)
+	req1.SetPathValue("id", "bad")
+	ListDocumentsByFolderHandler(nil)(rr1, req1)
+	if rr1.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for list by folder bad id: %d", rr1.Code)
+	}
+
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/api/catalog/documents/bad/history", nil)
+	req2.SetPathValue("id", "bad")
+	GetDocumentHistoryHandler(nil)(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for history bad id: %d", rr2.Code)
+	}
+
+	rr3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodGet, "/api/catalog/departments/bad/search?q=x", nil)
+	req3.SetPathValue("dept_id", "bad")
+	SearchDocumentsHandler(nil)(rr3, req3)
+	if rr3.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for search bad dept id: %d", rr3.Code)
+	}
+
+	rr4 := httptest.NewRecorder()
+	req4 := httptest.NewRequest(http.MethodGet, "/api/catalog/departments/1/search", nil)
+	req4.SetPathValue("dept_id", "1")
+	SearchDocumentsHandler(nil)(rr4, req4)
+	if rr4.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for missing query: %d", rr4.Code)
+	}
+
+	rr5 := httptest.NewRecorder()
+	req5 := httptest.NewRequest(http.MethodPatch, "/api/catalog/documents/bad/move", strings.NewReader(`{"folder_id":1}`))
+	req5.SetPathValue("id", "bad")
+	MoveDocumentHandler(nil)(rr5, req5)
+	if rr5.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for move bad id: %d", rr5.Code)
+	}
+
+	rr6 := httptest.NewRecorder()
+	req6 := httptest.NewRequest(http.MethodPatch, "/api/catalog/documents/1/move", strings.NewReader(`{"folder_id"`))
+	req6.SetPathValue("id", "1")
+	MoveDocumentHandler(nil)(rr6, req6)
+	if rr6.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for move bad json: %d", rr6.Code)
+	}
+}
+
+func TestHideUnhideValidationAndPermissions(t *testing.T) {
+	h := &DocumentHandlers{}
+
+	rr1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPatch, "/api/catalog/documents/bad/hide", nil)
+	req1.SetPathValue("id", "bad")
+	h.HideDocumentHandler()(rr1, req1)
+	if rr1.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for hide bad id: %d", rr1.Code)
+	}
+
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPatch, "/api/catalog/documents/1/hide", nil)
+	req2.SetPathValue("id", "1")
+	h.HideDocumentHandler()(rr2, req2)
+	if rr2.Code != http.StatusForbidden {
+		t.Fatalf("unexpected status for hide without head/admin: %d", rr2.Code)
+	}
+
+	rr3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodPatch, "/api/catalog/documents/1/unhide", nil)
+	req3.SetPathValue("id", "1")
+	UnhideDocumentHandler(nil)(rr3, req3)
+	if rr3.Code != http.StatusForbidden {
+		t.Fatalf("unexpected status for unhide without admin: %d", rr3.Code)
+	}
+}
+
+===== ./go-services/catalog-service/api/handlers/folder_type_handlers_test.go =====
+package handlers
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestFolderHandlersValidation(t *testing.T) {
+	rr1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodGet, "/api/catalog/departments/bad/folders", nil)
+	req1.SetPathValue("dept_id", "bad")
+	ListFoldersHandler(nil)(rr1, req1)
+	if rr1.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for list folders bad dept: %d", rr1.Code)
+	}
+
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/api/catalog/departments/bad/folders", nil)
+	req2.SetPathValue("dept_id", "bad")
+	CreateFolderHandler(nil)(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for create folder bad dept: %d", rr2.Code)
+	}
+
+	rr3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodDelete, "/api/catalog/folders/bad", nil)
+	req3.SetPathValue("id", "bad")
+	DeleteFolderHandler(nil)(rr3, req3)
+	if rr3.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for delete folder bad id: %d", rr3.Code)
+	}
+
+	rr4 := httptest.NewRecorder()
+	req4 := httptest.NewRequest(http.MethodPatch, "/api/catalog/folders/bad/rename", strings.NewReader(`{"name":"x"}`))
+	req4.SetPathValue("id", "bad")
+	RenameFolderHandler(nil)(rr4, req4)
+	if rr4.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for rename folder bad id: %d", rr4.Code)
+	}
+
+	rr5 := httptest.NewRecorder()
+	req5 := httptest.NewRequest(http.MethodPatch, "/api/catalog/folders/1/rename", strings.NewReader(`{"name"`))
+	req5.SetPathValue("id", "1")
+	RenameFolderHandler(nil)(rr5, req5)
+	if rr5.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for rename folder bad json: %d", rr5.Code)
+	}
+
+	rr6 := httptest.NewRecorder()
+	req6 := httptest.NewRequest(http.MethodPatch, "/api/catalog/folders/bad/move", strings.NewReader(`{"parent_id":1}`))
+	req6.SetPathValue("id", "bad")
+	MoveFolderHandler(nil)(rr6, req6)
+	if rr6.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for move folder bad id: %d", rr6.Code)
+	}
+
+	rr7 := httptest.NewRecorder()
+	req7 := httptest.NewRequest(http.MethodPatch, "/api/catalog/folders/1/move", strings.NewReader(`{"parent_id"`))
+	req7.SetPathValue("id", "1")
+	MoveFolderHandler(nil)(rr7, req7)
+	if rr7.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for move folder bad json: %d", rr7.Code)
+	}
+}
+
+func TestInitDepartmentFoldersHandlerPermissionsAndValidation(t *testing.T) {
+	rr1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "/api/catalog/departments/1/init", nil)
+	req1.SetPathValue("dept_id", "1")
+	InitDepartmentFoldersHandler(nil)(rr1, req1)
+	if rr1.Code != http.StatusForbidden {
+		t.Fatalf("unexpected status without admin role: %d", rr1.Code)
+	}
+}
+
+func TestDocumentTypeHandlersValidation(t *testing.T) {
+	rr1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "/api/catalog/types", strings.NewReader(`{"name"`))
+	CreateDocumentTypeHandler(nil)(rr1, req1)
+	if rr1.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for create type bad json: %d", rr1.Code)
+	}
+
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodDelete, "/api/catalog/types/bad", nil)
+	req2.SetPathValue("id", "bad")
+	DeleteDocumentTypeHandler(nil)(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for delete type bad id: %d", rr2.Code)
+	}
+}
+
+===== ./go-services/catalog-service/api/handlers/helpers_test.go =====
+package handlers
+
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestDecodeJSONCatalog(t *testing.T) {
+	req := httptest.NewRequest("POST", "/", strings.NewReader(`{"name":"folder"}`))
+	var v struct {
+		Name string `json:"name"`
+	}
+	if err := decodeJSON(req, &v); err != nil {
+		t.Fatalf("decodeJSON error: %v", err)
+	}
+	if v.Name != "folder" {
+		t.Fatalf("unexpected decoded value: %+v", v)
+	}
+}
+
+func TestDecodeJSONCatalogInvalid(t *testing.T) {
+	req := httptest.NewRequest("POST", "/", strings.NewReader(`{"name"`))
+	var v map[string]string
+	if err := decodeJSON(req, &v); err == nil {
+		t.Fatal("expected decode error")
+	}
+}
+
+func TestPathInt32Catalog(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.SetPathValue("id", "42")
+	n, err := pathInt32(req, "id")
+	if err != nil {
+		t.Fatalf("pathInt32 error: %v", err)
+	}
+	if n != 42 {
+		t.Fatalf("unexpected parsed value: %d", n)
+	}
+}
+
+func TestPathInt32CatalogInvalid(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.SetPathValue("id", "abc")
+	if _, err := pathInt32(req, "id"); err == nil {
+		t.Fatal("expected parse error")
+	}
+}
+
+===== ./go-services/collaboration-service/api/handlers/helpers_test.go =====
+package handlers
+
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestDecodeJSONCollaboration(t *testing.T) {
+	req := httptest.NewRequest("POST", "/", strings.NewReader(`{"content":"hello"}`))
+	var v struct {
+		Content string `json:"content"`
+	}
+	if err := decodeJSON(req, &v); err != nil {
+		t.Fatalf("decodeJSON error: %v", err)
+	}
+	if v.Content != "hello" {
+		t.Fatalf("unexpected decoded value: %+v", v)
+	}
+}
+
+func TestPathInt32Collaboration(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.SetPathValue("id", "7")
+	n, err := pathInt32(req, "id")
+	if err != nil {
+		t.Fatalf("pathInt32 error: %v", err)
+	}
+	if n != 7 {
+		t.Fatalf("unexpected parsed value: %d", n)
+	}
+}
+
+func TestQueryInt32Collaboration(t *testing.T) {
+	req := httptest.NewRequest("GET", "/?limit=15&offset=3", nil)
+	if got := queryInt32(req, "limit", 30); got != 15 {
+		t.Fatalf("unexpected limit: %d", got)
+	}
+	if got := queryInt32(req, "offset", 0); got != 3 {
+		t.Fatalf("unexpected offset: %d", got)
+	}
+	if got := queryInt32(req, "missing", 99); got != 99 {
+		t.Fatalf("unexpected default value: %d", got)
+	}
+}
+
+func TestQueryInt32CollaborationInvalid(t *testing.T) {
+	req := httptest.NewRequest("GET", "/?limit=bad", nil)
+	if got := queryInt32(req, "limit", 30); got != 30 {
+		t.Fatalf("unexpected fallback value: %d", got)
+	}
+}
+
+===== ./go-services/collaboration-service/service/audit_test.go =====
+package service
+
+import (
+	"context"
+	"database/sql"
+	"regexp"
+	"testing"
+	"time"
+
+	db "collaboration-service/db/generated"
+
+	"github.com/DATA-DOG/go-sqlmock"
+)
+
+func newCollabQueries(t *testing.T) (*db.Queries, sqlmock.Sqlmock, *sql.DB) {
+	t.Helper()
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New error: %v", err)
+	}
+	return db.New(sqlDB), mock, sqlDB
+}
+
+func TestListAuditByDepartment(t *testing.T) {
+	q, mock, sqlDB := newCollabQueries(t)
+	defer sqlDB.Close()
+
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, department_id, document_id, actor_login, action, details, created_at\nFROM audit_logs\nWHERE department_id = $1\nORDER BY created_at DESC\nLIMIT $2 OFFSET $3")).
+		WithArgs(sql.NullInt32{Int32: 2, Valid: true}, int32(20), int32(0)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "department_id", "document_id", "actor_login", "action", "details", "created_at"}).
+			AddRow(int32(1), int32(2), int32(3), "admin", "DOC_APPROVED", "ok", now))
+
+	logs, err := ListAuditByDepartment(context.Background(), q, 2, 20, 0)
+	if err != nil {
+		t.Fatalf("ListAuditByDepartment error: %v", err)
+	}
+	if len(logs) != 1 || logs[0].Action != "DOC_APPROVED" {
+		t.Fatalf("unexpected logs: %+v", logs)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestListAuditByDocument(t *testing.T) {
+	q, mock, sqlDB := newCollabQueries(t)
+	defer sqlDB.Close()
+
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, department_id, document_id, actor_login, action, details, created_at\nFROM audit_logs\nWHERE document_id = $1\nORDER BY created_at DESC")).
+		WithArgs(sql.NullInt32{Int32: 5, Valid: true}).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "department_id", "document_id", "actor_login", "action", "details", "created_at"}).
+			AddRow(int32(2), int32(2), int32(5), "head_dev", "DOC_SENT_FOR_APPROVAL", "note", now))
+
+	logs, err := ListAuditByDocument(context.Background(), q, 5)
+	if err != nil {
+		t.Fatalf("ListAuditByDocument error: %v", err)
+	}
+	if len(logs) != 1 || logs[0].DocumentID.Int32 != 5 {
+		t.Fatalf("unexpected logs: %+v", logs)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestWriteAuditLog(t *testing.T) {
+	q, mock, sqlDB := newCollabQueries(t)
+	defer sqlDB.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO audit_logs (department_id, document_id, actor_login, action, details)\nVALUES ($1, $2, $3, $4, $5)")).
+		WithArgs(
+			sql.NullInt32{Int32: 2, Valid: true},
+			sql.NullInt32{Int32: 7, Valid: true},
+			sql.NullString{String: "admin", Valid: true},
+			"DOC_APPROVED",
+			sql.NullString{String: "ok", Valid: true},
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err := WriteAuditLog(context.Background(), q, 2, 7, "admin", "DOC_APPROVED", "ok")
+	if err != nil {
+		t.Fatalf("WriteAuditLog error: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+===== ./go-services/iam-service/service/departments_test.go =====
+package service
+
+import (
+	"context"
+	"database/sql"
+	"regexp"
+	"strings"
+	"testing"
+
+	db "iam-service/db/generated"
+
+	"github.com/DATA-DOG/go-sqlmock"
+)
+
+func newIAMDeptQueries(t *testing.T) (*db.Queries, sqlmock.Sqlmock, *sql.DB) {
+	t.Helper()
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New error: %v", err)
+	}
+	return db.New(sqlDB), mock, sqlDB
+}
+
+func TestCreateDepartment(t *testing.T) {
+	q, mock, sqlDB := newIAMDeptQueries(t)
+	defer sqlDB.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO departments (name, parent_id) VALUES ($1, $2) RETURNING id")).
+		WithArgs("Новый отдел", sql.NullInt32{Int32: 1, Valid: true}).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int32(7)))
+
+	parent := int32(1)
+	id, err := CreateDepartment(context.Background(), q, "Новый отдел", &parent)
+	if err != nil {
+		t.Fatalf("CreateDepartment error: %v", err)
+	}
+	if id != 7 {
+		t.Fatalf("unexpected department id: %d", id)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestSetDepartmentParentRejectsSelfReference(t *testing.T) {
+	q, _, sqlDB := newIAMDeptQueries(t)
+	defer sqlDB.Close()
+
+	parent := int32(5)
+	err := SetDepartmentParent(context.Background(), q, 5, &parent)
+	if err == nil || !strings.Contains(err.Error(), "cannot be its own parent") {
+		t.Fatalf("expected self-reference error, got: %v", err)
+	}
+}
+
+func TestSetDepartmentParentAndDelete(t *testing.T) {
+	q, mock, sqlDB := newIAMDeptQueries(t)
+	defer sqlDB.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE departments SET parent_id = $2 WHERE id = $1")).
+		WithArgs(int32(5), sql.NullInt32{Int32: 1, Valid: true}).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	parent := int32(1)
+	if err := SetDepartmentParent(context.Background(), q, 5, &parent); err != nil {
+		t.Fatalf("SetDepartmentParent error: %v", err)
+	}
+
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM departments WHERE id = $1")).
+		WithArgs(int32(5)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := DeleteDepartment(context.Background(), q, 5); err != nil {
+		t.Fatalf("DeleteDepartment error: %v", err)
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, name, parent_id FROM departments ORDER BY name ASC")).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "parent_id"}).
+			AddRow(int32(1), "Дирекция", nil))
+	departments, err := ListDepartments(context.Background(), q)
+	if err != nil {
+		t.Fatalf("ListDepartments error: %v", err)
+	}
+	if len(departments) != 1 || departments[0].Name != "Дирекция" {
+		t.Fatalf("unexpected departments list: %+v", departments)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestToNullInt32(t *testing.T) {
+	if got := toNullInt32(nil); got.Valid {
+		t.Fatalf("expected invalid null int32, got %+v", got)
+	}
+	v := int32(8)
+	got := toNullInt32(&v)
+	if !got.Valid || got.Int32 != 8 {
+		t.Fatalf("unexpected null int32: %+v", got)
+	}
+}
+
+===== ./go-services/iam-service/service/users_test.go =====
+package service
+
+import (
+	"context"
+	"database/sql"
+	"regexp"
+	"strings"
+	"testing"
+
+	db "iam-service/db/generated"
+
+	"github.com/DATA-DOG/go-sqlmock"
+)
+
+func newIAMQueries(t *testing.T) (*db.Queries, sqlmock.Sqlmock, *sql.DB) {
+	t.Helper()
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New error: %v", err)
+	}
+	return db.New(sqlDB), mock, sqlDB
+}
+
+func TestFireUserForbiddenForRegularUser(t *testing.T) {
+	q, _, sqlDB := newIAMQueries(t)
+	defer sqlDB.Close()
+
+	err := FireUser(context.Background(), q, "user1", "2", false, "USER", 10)
+	if err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("expected forbidden error, got: %v", err)
+	}
+}
+
+func TestFireUserAdminSuccess(t *testing.T) {
+	q, mock, sqlDB := newIAMQueries(t)
+	defer sqlDB.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE users SET department_id = NULL WHERE id = $1")).
+		WithArgs(int32(10)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err := FireUser(context.Background(), q, "admin", "", false, "ADMIN", 10)
+	if err != nil {
+		t.Fatalf("FireUser error: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestFireUserHeadSameDepartment(t *testing.T) {
+	q, mock, sqlDB := newIAMQueries(t)
+	defer sqlDB.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, login, email, full_name, department_id, is_head, system_role FROM users WHERE id = $1")).
+		WithArgs(int32(10)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "login", "email", "full_name", "department_id", "is_head", "system_role"}).
+			AddRow(int32(10), "u", "u@x", "U", int32(2), false, "USER"))
+
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE users SET department_id = NULL WHERE id = $1")).
+		WithArgs(int32(10)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err := FireUser(context.Background(), q, "head_dev", "2", true, "USER", 10)
+	if err != nil {
+		t.Fatalf("FireUser error: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestFireUserHeadForeignDepartment(t *testing.T) {
+	q, mock, sqlDB := newIAMQueries(t)
+	defer sqlDB.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, login, email, full_name, department_id, is_head, system_role FROM users WHERE id = $1")).
+		WithArgs(int32(10)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "login", "email", "full_name", "department_id", "is_head", "system_role"}).
+			AddRow(int32(10), "u", "u@x", "U", int32(3), false, "USER"))
+
+	err := FireUser(context.Background(), q, "head_dev", "2", true, "USER", 10)
+	if err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("expected forbidden error, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestFireUserHeadTargetWithoutDepartment(t *testing.T) {
+	q, mock, sqlDB := newIAMQueries(t)
+	defer sqlDB.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, login, email, full_name, department_id, is_head, system_role FROM users WHERE id = $1")).
+		WithArgs(int32(10)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "login", "email", "full_name", "department_id", "is_head", "system_role"}).
+			AddRow(int32(10), "u", "u@x", "U", nil, false, "USER"))
+
+	err := FireUser(context.Background(), q, "head_dev", "2", true, "USER", 10)
+	if err == nil || !strings.Contains(err.Error(), "target user has no department") {
+		t.Fatalf("expected target user has no department, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestMovePromoteDemoteAndListWrappers(t *testing.T) {
+	q, mock, sqlDB := newIAMQueries(t)
+	defer sqlDB.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE users SET department_id = $2 WHERE id = $1")).
+		WithArgs(int32(5), sql.NullInt32{Int32: 3, Valid: true}).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := MoveUserToDepartment(context.Background(), q, 5, 3); err != nil {
+		t.Fatalf("MoveUserToDepartment error: %v", err)
+	}
+
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE users SET is_head = true WHERE id = $1")).
+		WithArgs(int32(5)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := PromoteUser(context.Background(), q, 5); err != nil {
+		t.Fatalf("PromoteUser error: %v", err)
+	}
+
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE users SET is_head = false WHERE id = $1")).
+		WithArgs(int32(5)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := DemoteUser(context.Background(), q, 5); err != nil {
+		t.Fatalf("DemoteUser error: %v", err)
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, full_name, login, is_head, department_id FROM users")).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "full_name", "login", "is_head", "department_id"}).
+			AddRow(int32(1), "Admin", "admin", false, int32(1)))
+	users, err := ListUsers(context.Background(), q)
+	if err != nil {
+		t.Fatalf("ListUsers error: %v", err)
+	}
+	if len(users) != 1 || users[0].Login != "admin" {
+		t.Fatalf("unexpected users list: %+v", users)
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, login, full_name, is_head FROM users WHERE department_id = $1")).
+		WithArgs(sql.NullInt32{Int32: 3, Valid: true}).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "login", "full_name", "is_head"}).
+			AddRow(int32(2), "user2", "User Two", false))
+	deptUsers, err := ListUsersByDepartment(context.Background(), q, 3)
+	if err != nil {
+		t.Fatalf("ListUsersByDepartment error: %v", err)
+	}
+	if len(deptUsers) != 1 || deptUsers[0].Login != "user2" {
+		t.Fatalf("unexpected department users list: %+v", deptUsers)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestMustParseInt(t *testing.T) {
+	if mustParseInt("123") != 123 {
+		t.Fatalf("unexpected parse for numeric string")
+	}
+	if mustParseInt("12a") != 0 {
+		t.Fatalf("unexpected parse for invalid string")
+	}
+	if mustParseInt("") != 0 {
+		t.Fatalf("unexpected parse for empty string")
+	}
+}
+
+===== ./go-services/orchestrator-service/api/handlers/helpers_test.go =====
+package handlers
+
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestDecodeJSONOrchestrator(t *testing.T) {
+	req := httptest.NewRequest("POST", "/", strings.NewReader(`{"question":"q"}`))
+	var v struct {
+		Question string `json:"question"`
+	}
+	if err := decodeJSON(req, &v); err != nil {
+		t.Fatalf("decodeJSON error: %v", err)
+	}
+	if v.Question != "q" {
+		t.Fatalf("unexpected decoded value: %+v", v)
+	}
+}
+
+func TestPathInt32Orchestrator(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.SetPathValue("id", "99")
+	n, err := pathInt32(req, "id")
+	if err != nil {
+		t.Fatalf("pathInt32 error: %v", err)
+	}
+	if n != 99 {
+		t.Fatalf("unexpected parsed value: %d", n)
+	}
+}
+
+func TestPathInt32OrchestratorInvalid(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.SetPathValue("id", "oops")
+	if _, err := pathInt32(req, "id"); err == nil {
+		t.Fatal("expected parse error")
+	}
+}
+
+===== ./go-services/orchestrator-service/api/handlers/workflow_handlers_test.go =====
+package handlers
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"docflow.local/pkg/auth"
+)
+
+func TestGetStatusHandlerInvalidID(t *testing.T) {
+	h := &WorkflowHandlers{}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/orchestrator/documents/bad/status", nil)
+	req.SetPathValue("id", "bad")
+	h.GetStatusHandler()(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+}
+
+func TestGetHistoryHandlerInvalidID(t *testing.T) {
+	h := &WorkflowHandlers{}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/orchestrator/documents/bad/history", nil)
+	req.SetPathValue("id", "bad")
+	h.GetHistoryHandler()(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+}
+
+func TestSendForVisaHandlerInvalidID(t *testing.T) {
+	h := &WorkflowHandlers{}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/orchestrator/documents/bad/send-for-visa", nil)
+	req.SetPathValue("id", "bad")
+	h.SendForVisaHandler()(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+}
+
+func TestSendForVisaHandlerInvalidJSON(t *testing.T) {
+	h := &WorkflowHandlers{}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/orchestrator/documents/1/send-for-visa", strings.NewReader(`{"note"`))
+	req.SetPathValue("id", "1")
+	h.SendForVisaHandler()(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+}
+
+func TestApproveHandlerInvalidID(t *testing.T) {
+	h := &WorkflowHandlers{}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/orchestrator/documents/bad/approve", nil)
+	req.SetPathValue("id", "bad")
+	h.ApproveHandler()(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+}
+
+func TestRejectHandlerInvalidInput(t *testing.T) {
+	h := &WorkflowHandlers{}
+
+	rr1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "/api/orchestrator/documents/bad/reject", nil)
+	req1.SetPathValue("id", "bad")
+	h.RejectHandler()(rr1, req1)
+	if rr1.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for bad id: %d", rr1.Code)
+	}
+
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/api/orchestrator/documents/1/reject", strings.NewReader(`{"revision_note"`))
+	req2.SetPathValue("id", "1")
+	h.RejectHandler()(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for bad json: %d", rr2.Code)
+	}
+}
+
+func TestRequestApprovalHandlerInvalidInput(t *testing.T) {
+	h := &WorkflowHandlers{}
+
+	rr1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "/api/orchestrator/documents/bad/request-approval", nil)
+	req1.SetPathValue("id", "bad")
+	h.RequestApprovalHandler()(rr1, req1)
+	if rr1.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for bad id: %d", rr1.Code)
+	}
+
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/api/orchestrator/documents/1/request-approval", strings.NewReader(`{"question"`))
+	req2.SetPathValue("id", "1")
+	h.RequestApprovalHandler()(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status for bad json: %d", rr2.Code)
+	}
+}
+
+func TestDelegateHandlerForbiddenForRegularUser(t *testing.T) {
+	h := &WorkflowHandlers{}
+	handler := auth.AuthMiddleware(h.DelegateHandler())
+
+	token, err := auth.GenerateToken(4, "user2", "USER", false, "3")
+	if err != nil {
+		t.Fatalf("GenerateToken error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/orchestrator/documents/3/delegate", strings.NewReader(`{"assignee_id":2}`))
+	req.SetPathValue("id", "3")
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "jwt_token", Value: token})
+
+	rr := httptest.NewRecorder()
+	handler(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("unexpected status: %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDelegateHandlerBadRequestWithoutAssignee(t *testing.T) {
+	h := &WorkflowHandlers{}
+	handler := auth.AuthMiddleware(h.DelegateHandler())
+
+	token, err := auth.GenerateToken(1, "admin", "ADMIN", false, "1")
+	if err != nil {
+		t.Fatalf("GenerateToken error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/orchestrator/documents/3/delegate", strings.NewReader(`{}`))
+	req.SetPathValue("id", "3")
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "jwt_token", Value: token})
+
+	rr := httptest.NewRecorder()
+	handler(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+===== ./pkg/auth/middleware_test.go =====
+package auth
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestGenerateTokenAndValidateToken(t *testing.T) {
+	token, err := GenerateToken(11, "alice", "ADMIN", true, "5")
+	if err != nil {
+		t.Fatalf("GenerateToken error: %v", err)
+	}
+
+	claims, err := ValidateToken(token)
+	if err != nil {
+		t.Fatalf("ValidateToken error: %v", err)
+	}
+
+	if claims["login"] != "alice" {
+		t.Fatalf("unexpected login claim: %v", claims["login"])
+	}
+	if claims["system_role"] != "ADMIN" {
+		t.Fatalf("unexpected system_role claim: %v", claims["system_role"])
+	}
+	if claims["is_head"] != true {
+		t.Fatalf("unexpected is_head claim: %v", claims["is_head"])
+	}
+	if claims["department_id"] != "5" {
+		t.Fatalf("unexpected department_id claim: %v", claims["department_id"])
+	}
+}
+
+func TestValidateTokenRejectsGarbage(t *testing.T) {
+	if _, err := ValidateToken("not-a-jwt"); err == nil {
+		t.Fatal("expected error for invalid token")
+	}
+}
+
+func TestAuthMiddlewareRejectsMissingToken(t *testing.T) {
+	called := false
+	h := AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	h(rr, req)
+
+	if called {
+		t.Fatal("next handler should not be called")
+	}
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+}
+
+func TestAuthMiddlewareSetsContext(t *testing.T) {
+	token, err := GenerateToken(7, "head_dev", "USER", true, "2")
+	if err != nil {
+		t.Fatalf("GenerateToken error: %v", err)
+	}
+
+	h := AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
+		login, ok := UserLoginFromContext(ctx)
+		if !ok || login != "head_dev" {
+			t.Fatalf("unexpected login from context: %q ok=%v", login, ok)
+		}
+
+		uid, ok := UserIDIntFromContext(ctx)
+		if !ok || uid != 7 {
+			t.Fatalf("unexpected user_id from context: %d ok=%v", uid, ok)
+		}
+
+		role, ok := SystemRoleFromContext(ctx)
+		if !ok || role != "USER" {
+			t.Fatalf("unexpected role from context: %q ok=%v", role, ok)
+		}
+
+		isHead, ok := IsHeadFromContext(ctx)
+		if !ok || !isHead {
+			t.Fatalf("unexpected is_head from context: %v ok=%v", isHead, ok)
+		}
+
+		dept, ok := DepartmentIDFromContext(ctx)
+		if !ok || dept != "2" {
+			t.Fatalf("unexpected department_id from context: %q ok=%v", dept, ok)
+		}
+
+		if !HasRole(ctx, "USER") {
+			t.Fatal("HasRole should be true for USER")
+		}
+		if HasRole(ctx, "ADMIN") {
+			t.Fatal("HasRole should be false for ADMIN")
+		}
+
+		aliasID, ok := UserIDFromContext(ctx)
+		if !ok || aliasID != "head_dev" {
+			t.Fatalf("unexpected UserIDFromContext value: %q ok=%v", aliasID, ok)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "jwt_token", Value: token})
+	h(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+}
+
+func TestHasRoleWithoutContextRole(t *testing.T) {
+	if HasRole(context.Background(), "ADMIN") {
+		t.Fatal("HasRole should be false when context has no role")
+	}
+}
+
+===== ./pkg/httputil/respond_test.go =====
+package httputil
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestOK(t *testing.T) {
+	rr := httptest.NewRecorder()
+	OK(rr, map[string]string{"k": "v"})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+	if rr.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("unexpected content-type: %s", rr.Header().Get("Content-Type"))
+	}
+
+	var got map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("json unmarshal error: %v", err)
+	}
+	if got["k"] != "v" {
+		t.Fatalf("unexpected payload: %+v", got)
+	}
+}
+
+func TestCreated(t *testing.T) {
+	rr := httptest.NewRecorder()
+	Created(rr, map[string]int{"id": 1})
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+}
+
+func TestError(t *testing.T) {
+	rr := httptest.NewRecorder()
+	Error(rr, http.StatusForbidden, "forbidden")
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+
+	var got map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("json unmarshal error: %v", err)
+	}
+	if got["error"] != "forbidden" {
+		t.Fatalf("unexpected payload: %+v", got)
+	}
+}
+
+func TestNoContent(t *testing.T) {
+	rr := httptest.NewRecorder()
+	NoContent(rr)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+}
+
