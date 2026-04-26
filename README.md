@@ -1,1 +1,413 @@
 # dokumentooborot
+
+## Что это за проект и какую задачу решает
+
+Cистема электронного документооборота (СЭД) для внутренней работы отделов.
+Проект покрывает полный жизненный цикл документа:
+- создание/загрузка,
+- маршрутизация между сотрудниками и отделами,
+- визирование,
+- обсуждение,
+- аудит действий,
+- уведомления.
+
+Ключевая идея архитектуры:
+- бизнес-логика и API — в Go-сервисах,
+- инфраструктурные задачи (файлы/уведомления) — в Java-сервисах,
+- один PostgreSQL-кластер, но с разделением по схемам (database-per-service через schema-per-service),
+- синхронное взаимодействие по HTTP/gRPC и асинхронное через RabbitMQ.
+
+## Архитектурные принципы
+
+1. Разделение ответственности по сервисам.
+2. Изоляция данных по схемам БД.
+3. Явный API-контракт между сервисами.
+4. Безопасность на двух уровнях:
+- аутентификация через JWT,
+- авторизация через роль/признак начальника/отдел.
+5. Дублирование критичных ограничений на backend-уровне (не только в UI).
+6. Наблюдаемость через аудит событий и структурированные логи.
+
+### Состав системы
+
+- Frontend: React + TypeScript + Vite + Ant Design.
+- API gateway/reverse proxy: Caddy.
+- Go-сервисы:
+  - IAM Service,
+  - Catalog Service,
+  - Orchestrator Service,
+  - Collaboration Service.
+- Java-сервисы:
+  - File Service,
+  - Notification Service.
+- Инфраструктура:
+  - PostgreSQL,
+  - RabbitMQ,
+  - MinIO.
+
+### Как ходят запросы
+
+Синхронные потоки:
+- Browser -> Caddy -> Go HTTP API.
+- Orchestrator -> IAM/Catalog по gRPC.
+- Catalog -> File Service по gRPC.
+
+Асинхронные потоки:
+- Orchestrator публикует события в RabbitMQ exchanges:
+  - audit,
+  - notifications.
+- Collaboration читает audit и пишет журнал действий.
+- Notification Service читает notifications и отправляет e-mail (или пишет в лог в stub-режиме).
+
+### Caddy
+
+- /api/iam/* -> iam-service:8081
+- /api/catalog/* -> catalog-service:8082
+- /api/orchestrator/* -> orchestrator-service:8084
+- /api/collaboration/* -> collaboration-service:8083
+- остальное -> frontend:4173
+
+### Схемы PostgreSQL
+
+Используются схемы:
+- iam_schema,
+- catalog_schema,
+- collaboration_schema,
+- orchestrator_schema.
+
+Каждый сервис подключается своим DB-пользователем с нужным search_path.
+
+### Основные таблицы
+
+- iam_schema:
+  - departments,
+  - users.
+- catalog_schema:
+  - document_types,
+  - folders,
+  - documents,
+  - document_history.
+- collaboration_schema:
+  - messages,
+  - audit_logs.
+- orchestrator_schema:
+  - document_states,
+  - state_transitions.
+
+### Cвязи
+
+Часть связей хранится логически (по id/login), а не жесткими cross-schema FK.
+Это осознанный компромисс для микросервисной границы:
+- сервис владеет своей схемой,
+- валидация и согласованность достигаются через API-вызовы между сервисами.
+
+### IAM Service (Go)
+
+Роль:
+- login/logout/me,
+- управление сотрудниками и отделами,
+- выдача данных другим сервисам по gRPC (руководители, email).
+
+Порты:
+- HTTP 8081,
+- gRPC 9081.
+
+Ключевые HTTP маршруты:
+- POST /api/iam/auth/login
+- POST /api/iam/auth/logout
+- GET /api/iam/auth/me
+- POST /api/iam/auth/register
+- GET /api/iam/users
+- GET /api/iam/departments/{id}/users
+- POST /api/iam/users/fire
+- POST /api/iam/users/move
+- POST /api/iam/users/{id}/promote
+- POST /api/iam/users/{id}/demote
+- GET /api/iam/departments
+- POST /api/iam/departments
+- PATCH /api/iam/departments/{id}/parent
+- DELETE /api/iam/departments/{id}
+
+Ограничения:
+- создание привилегированных аккаунтов (ADMIN или is_head) только ADMIN,
+- операции с отделами только ADMIN,
+- для не-admin доступ к пользователям/аудиту ограничен своим отделом.
+
+### Catalog Service (Go)
+
+Роль:
+- хранение метаданных документов,
+- операции с папками и типами,
+- загрузка/скачивание файлов через File Service.
+
+Порты:
+- HTTP 8082,
+- gRPC 9082.
+
+Ключевые HTTP маршруты:
+- GET/POST/DELETE /api/catalog/types...
+- GET/POST /api/catalog/departments/{dept_id}/folders
+- DELETE/PATCH /api/catalog/folders/{id}...
+- POST /api/catalog/documents
+- GET /api/catalog/documents/{id}
+- GET /api/catalog/documents/{id}/download
+- PATCH /api/catalog/documents/{id}/move
+- POST /api/catalog/documents/{id}/hide
+- POST /api/catalog/documents/{id}/unhide
+- GET /api/catalog/departments/{dept_id}/search
+- GET /api/catalog/documents/{id}/history
+
+Критичная серверная авторизация (актуальные фиксы):
+- не-admin может загружать только в свой отдел,
+- целевая папка обязана принадлежать выбранному отделу,
+- head_only запрещена для обычного сотрудника,
+- скрытые документы доступны ограниченно.
+
+### Orchestrator Service (Go)
+
+Роль:
+- управление workflow состояния документа,
+- координация действий между IAM и Catalog,
+- публикация audit/notification событий.
+
+Порт:
+- HTTP 8084.
+
+FSM состояния:
+- DRAFT -> PENDING_VISA,
+- PENDING_VISA -> APPROVED,
+- PENDING_VISA -> REJECTED,
+- REJECTED -> DRAFT.
+
+Ключевые HTTP маршруты:
+- GET /api/orchestrator/documents/{id}/status
+- GET /api/orchestrator/documents/{id}/history
+- POST /api/orchestrator/documents/{id}/send-for-visa
+- POST /api/orchestrator/documents/{id}/approve
+- POST /api/orchestrator/documents/{id}/reject
+- POST /api/orchestrator/documents/{id}/delegate
+- POST /api/orchestrator/documents/{id}/request-approval
+
+Критичные ограничения:
+- delegate только для ADMIN или начальника отдела.
+
+### Collaboration Service (Go)
+
+Роль:
+- чат по документам,
+- чтение аудита,
+- consumer для записи audit-событий из RabbitMQ.
+
+Порт:
+- HTTP 8083.
+
+Маршруты:
+- GET /api/collaboration/documents/{id}/messages
+- POST /api/collaboration/documents/{id}/messages
+- GET /api/collaboration/departments/{dept_id}/audit
+- GET /api/collaboration/documents/{id}/audit
+
+Ограничения:
+- non-admin видит аудит только своего отдела.
+
+### File Service (Java)
+
+Роль:
+- gRPC adapter к MinIO: upload/download/delete.
+
+Порт:
+- gRPC 9091.
+
+Особенности:
+- bucket создается при необходимости,
+- object_path генерируется на основе UUID,
+- сервис не содержит бизнес-логики по ролям/маршрутам.
+
+### Notification Service (Java)
+
+Роль:
+- читает events из exchange notifications (fanout), queue notifications.queue,
+- формирует письмо по action-коду,
+- отправляет SMTP или пишет stub-лог, если SMTP не задан.
+
+
+
+### Аутентификация
+
+1. Пользователь отправляет login/password на /api/iam/auth/login.
+2. IAM проверяет учетные данные.
+3. IAM ставит cookie jwt_token (HttpOnly, SameSite=Strict).
+4. В следующих запросах auth middleware читает claims и прокладывает их в context.
+
+### Загрузка документа
+
+1. UI отправляет multipart-запрос на /api/catalog/documents.
+2. Catalog валидирует title/folder_id/department_id/права доступа.
+3. Catalog отправляет байты файла в File Service по gRPC.
+4. File Service кладет объект в MinIO и возвращает object_path.
+5. Catalog пишет карточку документа в catalog_schema.documents.
+6. UI получает document_id.
+
+### Отправка на визирование
+
+1. UI отправляет POST /api/orchestrator/documents/{id}/send-for-visa с note.
+2. Orchestrator через Catalog читает документ.
+3. Orchestrator через IAM получает руководителя отдела.
+4. Orchestrator меняет assignee у документа через Catalog gRPC.
+5. Orchestrator меняет статус документа и состояние FSM.
+6. Orchestrator пишет transition в orchestrator_schema.state_transitions.
+7. Orchestrator публикует audit + notification события.
+8. Collaboration записывает audit, Notification Service отправляет уведомление.
+
+### Визирование/отклонение
+
+Approve:
+1. POST /approve.
+2. FSM-переход в APPROVED.
+3. Catalog обновляет статус.
+4. Публикуются audit/notification.
+
+Reject:
+1. POST /reject c revision_note.
+2. FSM-переход через REJECTED и возврат в DRAFT в статусе документа.
+3. Публикуются audit/notification с причиной.
+
+### Делегирование
+
+1. POST /delegate c assignee_id.
+2. Проверяется роль: только ADMIN/head.
+3. Меняется assignee у документа.
+4. Пишется аудит и отправляется уведомление новому исполнителю.
+
+## карта use cases
+
+Ниже отражено текущее состояние проекта с акцентом на UC из файла uc.txt.
+
+| UC | Название | Где реализовано | Как работает сейчас | Статус |
+|---|---|---|---|---|
+| UC-1 | Загрузить шаблон документа из списка | Catalog + UI папок | Отдельного реестра шаблонов нет; шаблоны ведутся как документы в системной папке templates | Частично |
+| UC-2 | Изменить список шаблонов | Catalog folders/documents | Управляется через операции с папками/документами и системными папками | Частично |
+| UC-3 | Просмотреть список авторизованных сотрудников | IAM | GET /api/iam/users и GET /api/iam/departments/{id}/users | Реализовано |
+| UC-4 | Загрузить документ в систему | Catalog + File Service | POST /api/catalog/documents -> gRPC UploadFile -> MinIO -> metadata в БД | Реализовано |
+| UC-5 | Авторизироваться | IAM | POST /api/iam/auth/login, cookie jwt_token, middleware проверка в каждом сервисе | Реализовано |
+| UC-6 | Просмотреть список загруженных документов отдела | Catalog | Документы по папкам отдела + UI страницы документов | Реализовано |
+| UC-7 | Скрыть документ | Catalog | Head/Admin могут скрывать; unhide только Admin | Реализовано |
+| UC-8 | Делегировать документ | Orchestrator | POST /delegate, доступ только ADMIN/head, смена assignee | Реализовано |
+| UC-9 | Прикрепить на визирование начальнику | Orchestrator + IAM + Catalog | POST /send-for-visa, подбор руководителя отдела, смена статуса/assignee | Реализовано |
+| UC-10 | Отправить документ другому сотруднику/отделу | Orchestrator | Сотруднику: /delegate; в отдел: /request-approval с target_department_id | Частично |
+| UC-11 | Найти документ из архива отдела | Catalog | GET /api/catalog/departments/{dept_id}/search?q=... | Реализовано |
+| UC-12 | Обсудить документ | Collaboration | GET/POST messages по документу | Реализовано |
+| UC-13 | Завизировать документ | Orchestrator | POST /approve и POST /reject, FSM и аудит | Реализовано |
+| UC-14 | Просмотреть журнал действий отдела | Collaboration | GET /departments/{dept_id}/audit и /documents/{id}/audit | Реализовано |
+| UC-15 | Изменить статус отдела в иерархии | IAM | PATCH /api/iam/departments/{id}/parent | Реализовано |
+| UC-16 | Получить уведомление о событии | Orchestrator + Notification | Publish в exchange notifications, consumer отправляет e-mail/лог | Реализовано |
+| UC-17 | Выгрузить документ для локального редактирования | Catalog + File Service | GET /api/catalog/documents/{id}/download | Реализовано |
+| UC-18 | Выгрузить внутренние метрики системы | Нет endpoint | В текущем backend нет выделенного API/задачи экспорта метрик | Не реализовано |
+| UC-19 | Настроить тип документа | Catalog | CRUD по /api/catalog/types | Реализовано |
+| UC-20 | Изменение состава отдела | IAM | Move/Fire пользователя, переводы между отделами | Реализовано |
+| UC-21 | Изменение должности сотрудника | IAM | Promote/Demote (head flag) | Реализовано |
+
+
+### Где проверяются права 
+
+Права проверяются на backend:
+- IAM: admin-only операции с оргструктурой/привилегированными аккаунтами,
+- Catalog: ограничения загрузки по отделу и head_only,
+- Orchestrator: ограничения на delegate,
+- Collaboration: ограничение аудита по отделу для non-admin.
+
+### Предварительные требования
+
+На машине должны быть:
+1. Docker Desktop (или Docker Engine + Compose plugin).
+2. Node.js 20+ и npm (для локальной разработки Frontend).
+3. Порты должны быть свободны:
+- 80 (Caddy),
+- 8081, 8082, 8083, 8084 (Go HTTP),
+- 9081, 9082, 9091 (gRPC),
+- 5432 (Postgres),
+- 5672, 15672 (RabbitMQ),
+- 9000, 9001 (MinIO).
+
+### Полный запуск
+
+1. Перейти в папку backend:
+- cd /Users/Pudge/study/coorsachi/DocFlow/Backend
+
+2. Собрать и поднять все сервисы:
+- docker compose -f docker-compose.yml up -d --build
+
+3. Проверить статус:
+- docker compose -f docker-compose.yml ps
+
+4. Дождаться healthy для postgres/rabbitmq/minio.
+
+5. Открыть приложение:
+- http://localhost
+
+6. Технические web-ui:
+- RabbitMQ: http://localhost:15672 (guest/guest)
+- MinIO Console: http://localhost:9001 (minioadmin/minioadmin)
+
+### Локальный dev-режим фронта + backend в Docker
+
+1. Поднять backend-контур через compose.
+2. Перейти во frontend:
+- cd /Users/Pudge/study/coorsachi/DocFlow/Frontend
+
+3. Установить зависимости:
+- npm install
+
+4. Запустить dev-сервер:
+- npm run dev
+
+5. Открыть:
+- http://localhost:5173
+
+Важно:
+- Vite proxy направляет /api на http://localhost (Caddy),
+- поэтому фронт в dev-режиме работает с тем же API-контуром.
+
+### seed
+
+В init-скрипте заданы тестовые пользователи:
+- admin / admin123
+- head_dev / head123
+- user1 / user123
+- user2 / user123
+
+
+### Проверка
+
+Минимальный smoke-check:
+1. Логин:
+- POST /api/iam/auth/login
+2. Проверка текущего пользователя:
+- GET /api/iam/auth/me
+3. Получение папок отдела:
+- GET /api/catalog/departments/{dept_id}/folders
+4. Получение аудита:
+- GET /api/collaboration/departments/{dept_id}/audit
+
+Проверка логов по сервисам:
+- docker compose -f docker-compose.yml logs -f iam-service
+- docker compose -f docker-compose.yml logs -f catalog-service
+- docker compose -f docker-compose.yml logs -f orchestrator-service
+- docker compose -f docker-compose.yml logs -f collaboration-service
+- docker compose -f docker-compose.yml logs -f notification-service
+- docker compose -f docker-compose.yml logs -f file-service
+
+### Тестирование
+
+Автозапуск всех Go-тестов:
+- cd /Users/Pudge/study/coorsachi/DocFlow/Backend
+- ./run_all_tests.sh
+
+Скрипт:
+- прогоняет тесты по модулям,
+- строит coverage-файлы,
+- собирает общий coverage,
+- складывает отчеты в .test-reports/<timestamp>.
+
+
+
