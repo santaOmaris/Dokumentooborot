@@ -1,23 +1,13 @@
-# macOS
-.DS_Store
 
-# Node
+.DS_Store
 node_modules/
 Frontend/node_modules/
 Frontend/dist/
-
-# Go test artifacts
 Backend/.test-reports/
 *.cover
-
-# Java/Gradle build outputs
 Backend/java-services/**/build/
 Backend/java-services/**/.gradle/
-
-# IDE
 .vscode/
 .idea/
-
-# Logs and temp
 *.log
 tmp/
