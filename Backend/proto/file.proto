@@ -1,0 +1,43 @@
+syntax = "proto3";
+package file;
+option go_package = "docflow.local/pkg/pb/file;filepb";
+option java_package = "file";
+option java_outer_classname = "FileOuterClass";
+option java_multiple_files = false;
+
+// Используется catalog-service (Go) → file-service (Java) для хранения файлов в MinIO.
+
+message UploadFileRequest {
+  string filename = 1; // оригинальное имя файла
+  string bucket   = 2; // бакет MinIO (например "departments")
+  bytes  content  = 3; // содержимое файла
+}
+
+message UploadFileResponse {
+  string object_path = 1; // путь внутри бакета, напр. "dept-1/main/report.docx"
+}
+
+message DownloadFileRequest {
+  string bucket      = 1;
+  string object_path = 2;
+}
+
+message DownloadFileResponse {
+  bytes  content  = 1;
+  string filename = 2;
+}
+
+message DeleteFileRequest {
+  string bucket      = 1;
+  string object_path = 2;
+}
+
+message DeleteFileResponse {
+  bool success = 1;
+}
+
+service FileService {
+  rpc UploadFile(UploadFileRequest)     returns (UploadFileResponse);
+  rpc DownloadFile(DownloadFileRequest) returns (DownloadFileResponse);
+  rpc DeleteFile(DeleteFileRequest)     returns (DeleteFileResponse);
+}

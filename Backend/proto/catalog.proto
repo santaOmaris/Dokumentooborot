@@ -1,0 +1,68 @@
+syntax = "proto3";
+package catalog;
+option go_package = "docflow.local/pkg/pb/catalog;catalogpb";
+
+// Используется оркестратором: получить мета-данные документа.
+message GetDocumentRequest {
+  int32 document_id = 1;
+}
+
+message DocumentResponse {
+  int32  id            = 1;
+  string title         = 2;
+  string file_path     = 3;
+  int32  department_id = 4;
+  int32  created_by    = 5;
+  int32  assignee_id   = 6;
+  string status        = 7;
+}
+
+// Используется оркестратором: сменить ответственного по документу.
+message ChangeAssigneeRequest {
+  int32 document_id    = 1;
+  int32 new_assignee_id = 2;
+}
+
+message ChangeAssigneeResponse {
+  bool success = 1;
+}
+
+// Используется оркестратором: обновить статус FSM документа.
+message UpdateDocumentStatusRequest {
+  int32  document_id = 1;
+  string status      = 2;
+}
+
+message UpdateDocumentStatusResponse {
+  bool success = 1;
+}
+
+message GetSystemFolderRequest {
+  int32 department_id = 1;
+  string name = 2;
+}
+
+message FolderResponse {
+  int32 id = 1;
+  int32 department_id = 2;
+  string name = 3;
+  bool is_system = 4;
+}
+
+message MoveDocumentRequest {
+  int32 document_id = 1;
+  int32 folder_id = 2;
+  string actor_login = 3;
+}
+
+message MoveDocumentResponse {
+  bool success = 1;
+}
+
+service CatalogService {
+  rpc GetDocument(GetDocumentRequest)                           returns (DocumentResponse);
+  rpc ChangeDocumentAssignee(ChangeAssigneeRequest)            returns (ChangeAssigneeResponse);
+  rpc UpdateDocumentStatus(UpdateDocumentStatusRequest)        returns (UpdateDocumentStatusResponse);
+  rpc GetSystemFolder(GetSystemFolderRequest)                  returns (FolderResponse);
+  rpc MoveDocument(MoveDocumentRequest)                        returns (MoveDocumentResponse);
+}

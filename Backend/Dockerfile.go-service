@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1
+# Build context: Backend/
+# Build arg: SERVICE=iam-service | catalog-service | collaboration-service | orchestrator-service
+
+ARG SERVICE=iam-service
+
+FROM golang:1.25-alpine AS builder
+ARG SERVICE
+WORKDIR /workspace
+
+# go.work ссылается на все модули — копируем всё
+COPY go.work go.work.sum ./
+COPY pkg/ pkg/
+COPY go-services/ go-services/
+
+RUN cd go-services/${SERVICE} && \
+    go build -ldflags="-s -w" -o /app/service . && \
+    chmod +x /app/service
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates tzdata
+COPY --from=builder /app/service /service
+ENTRYPOINT ["/service"]

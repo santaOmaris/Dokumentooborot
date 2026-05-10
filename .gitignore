@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+Frontend/node_modules/
+Frontend/dist/
+
+# Go test artifacts
+Backend/.test-reports/
+*.cover
+
+# Local backend binaries (built manually)
+Backend/catalog-service
+Backend/collaboration-service
+Backend/iam-service
+Backend/orchestrator-service
+
+# Java/Gradle build outputs
+Backend/java-services/**/build/
+Backend/java-services/**/.gradle/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs and temp
+*.log
+tmp/
+
+# Local secrets
+Backend/.env
